@@ -1,0 +1,287 @@
+-- Get sepsis patients (Sepsis-3) who were in the ICU for the first time
+WITH sepsis_patients AS (
+  SELECT s3.stay_id, s3.subject_id, icu.hadm_id
+  FROM `physionet-data.mimiciv_derived.sepsis3` s3
+  JOIN `physionet-data.mimiciv_derived.icustay_detail` icu
+    ON s3.stay_id = icu.stay_id
+  WHERE s3.sepsis3 = TRUE
+    AND icu.first_icu_stay = TRUE
+),
+
+-- Get only the first invasive ventilation event for each sepsis patient
+ventilated_patients AS (
+  SELECT s.stay_id, s.subject_id, s.hadm_id,
+         v.starttime AS ventilation_starttime,
+         v.endtime AS weaning_time
+  FROM sepsis_patients s
+  JOIN `physionet-data.mimiciv_derived.ventilation` v
+    ON s.stay_id = v.stay_id
+  WHERE v.ventilation_status = 'InvasiveVent'
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY s.stay_id ORDER BY v.starttime) = 1
+),
+
+-- Check if the patient was reintubated within 48 hours after weaning
+reintubation_check AS (
+  SELECT DISTINCT vp.stay_id
+  FROM ventilated_patients vp
+  JOIN `physionet-data.mimiciv_derived.ventilation` v
+    ON vp.stay_id = v.stay_id
+  WHERE v.ventilation_status = 'InvasiveVent'
+    AND v.starttime BETWEEN vp.weaning_time AND DATETIME_ADD(vp.weaning_time, INTERVAL 48 HOUR)
+),
+
+-- Check if the patient died within 48 hours after weaning
+death_check AS (
+  SELECT DISTINCT vp.stay_id
+  FROM ventilated_patients vp
+  JOIN `physionet-data.mimiciv_derived.icustay_detail` detail
+    ON vp.stay_id = detail.stay_id
+  WHERE detail.dod BETWEEN vp.weaning_time AND DATETIME_ADD(vp.weaning_time, INTERVAL 48 HOUR)
+),
+
+-- Check if the patient had non-invasive ventilation for 48 hours or more
+niv_check AS (
+  SELECT vp.stay_id
+  FROM ventilated_patients vp
+  JOIN `physionet-data.mimiciv_derived.ventilation` v
+    ON vp.stay_id = v.stay_id
+  WHERE v.ventilation_status = 'NonInvasiveVent'
+    AND v.starttime < DATETIME_ADD(vp.weaning_time, INTERVAL 48 HOUR)
+  GROUP BY vp.stay_id
+  HAVING SUM(DATETIME_DIFF(v.endtime, v.starttime, HOUR)) >= 48
+),
+
+-- Get vitals within 24 hours before weaning
+vitals AS (
+  SELECT vp.stay_id,
+         MAX(v.heart_rate) AS max_heart_rate,
+         MAX(v.resp_rate) AS max_resp_rate,
+         MIN(v.mbp) AS min_map,
+         MIN(v.spo2) AS min_spo2,
+         MAX(v.temperature) AS max_temp
+  FROM ventilated_patients vp
+  JOIN `physionet-data.mimiciv_derived.vitalsign` v
+    ON vp.stay_id = v.stay_id
+  WHERE v.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time
+  GROUP BY vp.stay_id
+),
+
+-- Get lab results (chemistry)
+chem AS (
+  SELECT vp.hadm_id,
+         MAX(c.creatinine) AS max_creatinine,
+         MAX(c.aniongap) AS max_aniongap
+  FROM ventilated_patients vp
+  JOIN `physionet-data.mimiciv_derived.chemistry` c
+    ON vp.hadm_id = c.hadm_id
+  WHERE c.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time
+  GROUP BY vp.hadm_id
+),
+
+-- Get complete blood count
+cbc AS (
+  SELECT vp.hadm_id,
+         MAX(cbc.wbc) AS max_wbc,
+         MIN(cbc.hemoglobin) AS min_hb,
+         MIN(cbc.platelet) AS min_platelet
+  FROM ventilated_patients vp
+  JOIN `physionet-data.mimiciv_derived.complete_blood_count` cbc
+    ON vp.hadm_id = cbc.hadm_id
+  WHERE cbc.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time
+  GROUP BY vp.hadm_id
+),
+
+-- Get arterial blood gases
+abg AS (
+  SELECT vp.hadm_id,
+         MIN(bg.ph) AS min_ph,
+         MIN(bg.po2) AS min_pao2,
+         MAX(bg.pco2) AS max_paco2,
+         MIN(bg.baseexcess) AS min_baseexcess,
+         MIN(bg.pao2fio2ratio) AS min_pao2fio2ratio
+  FROM ventilated_patients vp
+  JOIN `physionet-data.mimiciv_derived.bg` bg
+    ON vp.hadm_id = bg.hadm_id
+  WHERE bg.specimen = 'ART.'
+    AND bg.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time
+  GROUP BY vp.hadm_id
+),
+
+-- Get lowest GCS score
+gcs AS (
+  SELECT vp.stay_id,
+         MIN(g.gcs) AS min_gcs
+  FROM ventilated_patients vp
+  JOIN `physionet-data.mimiciv_derived.gcs` g
+    ON vp.stay_id = g.stay_id
+  WHERE g.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time
+  GROUP BY vp.stay_id
+),
+
+-- Get highest PEEP in the last 24h
+peep AS (
+  SELECT vp.stay_id,
+         MAX(vs.peep) AS max_peep
+  FROM ventilated_patients vp
+  JOIN `physionet-data.mimiciv_derived.ventilator_setting` vs
+    ON vp.stay_id = vs.stay_id
+  WHERE vs.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time
+  GROUP BY vp.stay_id
+),
+
+-- Calculate BMI from height and weight
+bmi AS (
+  SELECT vp.stay_id,
+         (w.weight / POW(h.height / 100, 2)) AS bmi
+  FROM ventilated_patients vp
+  LEFT JOIN `physionet-data.mimiciv_derived.first_day_height` h ON vp.stay_id = h.stay_id
+  LEFT JOIN `physionet-data.mimiciv_derived.first_day_weight` w ON vp.stay_id = w.stay_id
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY vp.stay_id ORDER BY w.weight) = 1
+),
+
+-- Get highest FiO2 in the last 24h
+fio2 AS (
+  SELECT vp.stay_id,
+         MAX(vs.fio2) AS highest_fio2
+  FROM ventilated_patients vp
+  JOIN `physionet-data.mimiciv_derived.ventilator_setting` vs
+    ON vp.stay_id = vs.stay_id
+  WHERE vs.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time
+  GROUP BY vp.stay_id
+),
+
+-- Get lowest tidal volume in the last 24h
+tidal_volume AS (
+  SELECT vp.stay_id,
+         MIN(vs.tidal_volume_observed) AS lowest_tidal_volume
+  FROM ventilated_patients vp
+  JOIN `physionet-data.mimiciv_derived.ventilator_setting` vs
+    ON vp.stay_id = vs.stay_id
+  WHERE vs.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time
+  GROUP BY vp.stay_id
+),
+
+
+-- Sum urine output in the last 24h
+urine AS (
+  SELECT vp.stay_id,
+         SUM(u.urineoutput) AS total_urine
+  FROM ventilated_patients vp
+  LEFT JOIN `physionet-data.mimiciv_derived.urine_output` u
+    ON vp.stay_id = u.stay_id
+  WHERE u.charttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time
+  GROUP BY vp.stay_id
+),
+
+-- Check for vasopressor use
+vasopressors AS (
+  SELECT vp.stay_id,
+         MAX(CASE WHEN va.norepinephrine > 0 OR va.epinephrine > 0 OR va.dopamine > 0 OR va.phenylephrine > 0 OR va.vasopressin > 0 THEN 1 ELSE 0 END) AS used
+  FROM ventilated_patients vp
+  LEFT JOIN `physionet-data.mimiciv_derived.vasoactive_agent` va
+    ON vp.stay_id = va.stay_id
+  WHERE va.starttime BETWEEN DATETIME_SUB(vp.weaning_time, INTERVAL 24 HOUR) AND vp.weaning_time
+  GROUP BY vp.stay_id
+),
+
+-- Count antibiotic days before weaning
+antibiotics AS (
+  SELECT vp.hadm_id,
+         SUM(DATETIME_DIFF(abx.stoptime, abx.starttime, DAY)) AS abx_days
+  FROM ventilated_patients vp
+  JOIN `physionet-data.mimiciv_derived.antibiotic` abx
+    ON vp.hadm_id = abx.hadm_id
+  WHERE abx.starttime < vp.weaning_time
+  GROUP BY vp.hadm_id
+),
+
+-- Count CRRT days
+crrt AS (
+  SELECT vp.stay_id,
+         COUNT(DISTINCT DATE(c.charttime)) AS crrt_days
+  FROM ventilated_patients vp
+  JOIN `physionet-data.mimiciv_derived.crrt` c
+    ON vp.stay_id = c.stay_id
+  WHERE c.charttime < vp.weaning_time
+  GROUP BY vp.stay_id
+)
+
+-- Final query to bring all together
+SELECT
+  vp.stay_id,
+  vp.subject_id,
+
+  -- Weaning success flag
+  CASE
+    WHEN re.stay_id IS NOT NULL OR d.stay_id IS NOT NULL OR niv.stay_id IS NOT NULL THEN 0
+    ELSE 1
+  END AS weaning_success,
+
+  -- Demographics and scores
+  a.age,
+  d2.gender AS sex,
+  bmi.bmi,
+  c.charlson_comorbidity_index,
+  c.chronic_pulmonary_disease,
+  c.congestive_heart_failure,
+  c.dementia,
+  c.severe_liver_disease,
+  c.renal_disease,
+  c.rheumatic_disease,
+  c.diabetes_with_cc + c.diabetes_without_cc AS diabetes,
+  
+
+  -- Durations
+  DATETIME_DIFF(vp.weaning_time, vp.ventilation_starttime, DAY) AS imv_duration_days,
+  COALESCE(vaso.used, 0) AS vasopressor_used,
+  COALESCE(abx.abx_days, 0) AS antibiotic_days,
+  COALESCE(crrt.crrt_days, 0) AS crrt_days,
+  urine.total_urine,
+
+  -- Labs and vitals
+  vitals.max_heart_rate,
+  vitals.max_resp_rate,
+  vitals.min_map,
+  vitals.min_spo2,
+  vitals.max_temp,
+  chem.max_creatinine,
+  chem.max_aniongap,
+  cbc.max_wbc,
+  cbc.min_hb,
+  cbc.min_platelet,
+  abg.min_ph,
+  abg.min_pao2,
+  abg.max_paco2,
+  abg.min_baseexcess,
+  tidal_volume.lowest_tidal_volume,
+  abg.min_pao2fio2ratio AS lowest_oi,
+  fio2.highest_fio2,
+  gcs.min_gcs,
+  peep.max_peep
+  
+
+FROM ventilated_patients vp
+LEFT JOIN reintubation_check re ON vp.stay_id = re.stay_id
+LEFT JOIN death_check d ON vp.stay_id = d.stay_id
+LEFT JOIN niv_check niv ON vp.stay_id = niv.stay_id
+LEFT JOIN `physionet-data.mimiciv_derived.age` a ON vp.hadm_id = a.hadm_id
+LEFT JOIN `physionet-data.mimiciv_derived.icustay_detail` d2 ON vp.stay_id = d2.stay_id
+LEFT JOIN `physionet-data.mimiciv_derived.charlson` c ON vp.hadm_id = c.hadm_id
+LEFT JOIN vitals ON vp.stay_id = vitals.stay_id
+LEFT JOIN chem ON vp.hadm_id = chem.hadm_id
+LEFT JOIN cbc ON vp.hadm_id = cbc.hadm_id
+LEFT JOIN abg ON vp.hadm_id = abg.hadm_id
+LEFT JOIN gcs ON vp.stay_id = gcs.stay_id
+LEFT JOIN peep ON vp.stay_id = peep.stay_id
+LEFT JOIN bmi ON vp.stay_id = bmi.stay_id
+LEFT JOIN urine ON vp.stay_id = urine.stay_id
+LEFT JOIN vasopressors vaso ON vp.stay_id = vaso.stay_id
+LEFT JOIN antibiotics abx ON vp.hadm_id = abx.hadm_id
+LEFT JOIN crrt ON vp.stay_id = crrt.stay_id
+LEFT JOIN fio2 ON vp.stay_id = fio2.stay_id
+LEFT JOIN tidal_volume ON vp.stay_id = tidal_volume.stay_id
+
+
+WHERE a.age >= 18 -- Only include adult patients
+
+ORDER BY vp.subject_id;
