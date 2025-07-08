@@ -59,6 +59,6 @@ Frontiers in Medicine. https://doi.org/10.3389/fmed.2021.814566
 
 ## 👩🏻‍💻 About Me
 
-Maria Carmen Sandate Trejo  
+Carmen Sandate  
 Post-Degree Diploma in Data Analytics – Langara College  
 💼 [Portfolio](https://sandate.vercel.app) | 🧠 [LinkedIn](https://www.linkedin.com/in/mariacarmensandate/)
